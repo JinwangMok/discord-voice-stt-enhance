@@ -62,6 +62,8 @@ cd %USERPROFILE%\workspace\discord-voice-stt-enhance
 set HERMES_LOCAL_STT_HOST=0.0.0.0
 runtime\launch-windows.bat
 ```
+This now starts the server in the background and writes logs under `runtime\logs\`.
+Use `runtime\stop-windows.bat` to stop it.
 
 ### 4) Check health
 Linux host:

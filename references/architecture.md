@@ -17,8 +17,10 @@ This repo now also owns the local STT runtime pieces:
 - `runtime/server.py` — local OpenAI-compatible transcription endpoint backed by `faster-whisper`
 - `runtime/client.py` — Hermes `local_command` thin client that POSTs audio to the local server and writes a `.txt` result
 - `runtime/setup.sh` — creates a uv-managed local env and installs runtime deps
-- `runtime/launch.sh` — runs the hot local STT server
+- `runtime/launch.sh` — runs the hot local STT server on Linux
 - `runtime/healthcheck.sh` — checks `/health`
+- `runtime/launch-windows.bat` — launches the Windows STT server in the background and records stdout/stderr logs plus a PID file under `runtime\logs\`
+- `runtime/stop-windows.bat` — stops the background Windows STT server using the saved PID file
 - `service/install-systemd.sh` — optional user-service installation
 
 ## Functional changes
