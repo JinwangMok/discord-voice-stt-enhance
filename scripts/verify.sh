@@ -6,6 +6,13 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCH_PATH="$REPO_DIR/patches/hermes-discord-voice-stt-enhance.patch"
 HERMES_DIR="${1:-/home/jinwang/.hermes/hermes-agent}"
 
+cd "$REPO_DIR"
+pytest tests/test_runtime_helpers.py -q
+pytest tests/test_service_render.py -q
+python -m py_compile runtime/helpers.py runtime/client.py runtime/server.py service/render.py
+
+echo "Repo unit checks: ok"
+
 if [[ ! -d "$HERMES_DIR/.git" ]]; then
   echo "Hermes git repo not found: $HERMES_DIR" >&2
   exit 1
@@ -20,5 +27,10 @@ else
 fi
 
 cd "$HERMES_DIR"
-source venv/bin/activate
-python -m pytest   tests/tools/test_managed_media_gateways.py -q   tests/tools/test_transcription_tools.py -q   tests/gateway/test_voice_command.py -q   tests/gateway/test_discord_opus.py -q   tests/gateway/test_stt_config.py -q   tests/integration/test_voice_channel_flow.py -q
+"$HERMES_DIR/venv/bin/python" -m pytest \
+  tests/tools/test_managed_media_gateways.py -q \
+  tests/tools/test_transcription_tools.py -q \
+  tests/gateway/test_voice_command.py -q \
+  tests/gateway/test_discord_opus.py -q \
+  tests/gateway/test_stt_config.py -q \
+  tests/integration/test_voice_channel_flow.py -q

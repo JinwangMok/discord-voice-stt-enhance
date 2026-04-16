@@ -1,32 +1,112 @@
 # discord-voice-stt-enhance
 
-Patch bundle for Hermes Discord voice-channel improvements, packaged outside the main `hermes-agent` repo.
+Patch bundle and local runtime repo for Hermes Discord voice-channel STT/TTS improvements, packaged outside the main `hermes-agent` repo.
 
-## What this bundle contains
-- OpenAI TTS config fix for `tts.openai.api_key` / `tts.openai.base_url`
-- Discord voice pipeline hardening with per-guild FIFO workers and session tokens
-- Discord voice STT quality-first runtime profile (`discord_voice`)
-- Front-end audio/noise filtering and low-confidence transcript rejection
-- Regression tests for the above behavior
+## What this repo now contains
+- Hermes patch bundle for Discord voice hardening and STT profile behavior
+- Local `faster-whisper` HTTP runtime for `large-v3-turbo`
+- Thin `local_command` client so Hermes can call the local runtime without new Hermes core changes
+- Optional user-level `systemd` service installation for reboot-safe local STT startup
+- Docs and helper scripts for wiring Hermes config and env
+
+## Recommended architecture
+- Keep upstream Hermes clean
+- Keep Discord voice STT/TTS custom work in this external repo
+- Run `large-v3-turbo` on the machine that actually has GPU access
+- Point Hermes `discord_voice` profile at `provider: local_command`
+- Let Hermes call `runtime/client.py`, which POSTs to the configured runtime URL
+- If Hermes runs in a Linux VM without GPU passthrough, host the STT runtime on the Windows 11 machine and set `HERMES_LOCAL_STT_SERVER_URL` to that host's reachable IP/port
 
 ## Repo layout
-- `patches/hermes-discord-voice-stt-enhance.patch` — patch to apply inside Hermes
-- `scripts/apply-hermes-patch.sh` — idempotent patch application
-- `scripts/install.sh` — convenience wrapper
-- `scripts/verify.sh` — validates patch state and runs focused tests
-- `references/architecture.md` — design notes and scope
+- `patches/hermes-discord-voice-stt-enhance.patch` — Hermes patch to apply inside Hermes
+- `runtime/` — local STT HTTP server, thin client, uv-managed env setup, launch/health scripts
+- `service/` — optional user `systemd` service helpers
+- `scripts/` — patch application + Hermes wiring helpers
+- `references/` — architecture and operations docs
+- `examples/` — config snippets
+- `tests/` — lightweight unit tests for helper logic in this repo
 
-## Install
+## Quick start
+
+### 1) Apply the Hermes patch
 ```bash
 ~/workspace/discord-voice-stt-enhance/scripts/install.sh /home/jinwang/.hermes/hermes-agent
 ```
 
-If no argument is given, the script defaults to `/home/jinwang/.hermes/hermes-agent`.
+### 2) Set up the STT runtime (uv-managed)
 
-## Verify
+Linux host:
 ```bash
-~/workspace/discord-voice-stt-enhance/scripts/verify.sh /home/jinwang/.hermes/hermes-agent
+cd ~/workspace/discord-voice-stt-enhance
+./runtime/setup.sh
 ```
 
+Windows 11 GPU host:
+```bat
+cd %USERPROFILE%\workspace\discord-voice-stt-enhance
+runtime\setup-windows.bat
+```
+
+### 3) Start the runtime manually
+
+Linux host:
+```bash
+cd ~/workspace/discord-voice-stt-enhance
+./runtime/launch.sh
+```
+
+Windows 11 GPU host:
+```bat
+cd %USERPROFILE%\workspace\discord-voice-stt-enhance
+set HERMES_LOCAL_STT_HOST=0.0.0.0
+runtime\launch-windows.bat
+```
+
+### 4) Check health
+Linux host:
+```bash
+cd ~/workspace/discord-voice-stt-enhance
+./runtime/healthcheck.sh
+```
+
+Windows 11 GPU host:
+```bat
+cd %USERPROFILE%\workspace\discord-voice-stt-enhance
+runtime\healthcheck-windows.bat
+```
+
+### 5) Print Hermes wiring snippet
+```bash
+cd ~/workspace/discord-voice-stt-enhance
+HERMES_LOCAL_STT_SERVER_URL=http://WINDOWS_HOST_IP:8177 ./scripts/configure-hermes-local-stt.sh
+```
+Copy the printed env into `~/.hermes/.env` and the YAML into `~/.hermes/config.yaml`.
+
+If Hermes and the STT runtime are on the same Linux machine, you can keep the default `http://127.0.0.1:8177`.
+If Hermes is in a Linux VM and the STT runtime is on the Windows GPU host, replace `WINDOWS_HOST_IP` with the Windows host IP reachable from the VM.
+
+### 6) Optional: install as user systemd service
+```bash
+cd ~/workspace/discord-voice-stt-enhance
+./service/install-systemd.sh
+```
+
+### 7) Verify
+```bash
+cd ~/workspace/discord-voice-stt-enhance
+./scripts/verify.sh /home/jinwang/.hermes/hermes-agent
+```
+
+## Key env defaults
+See `runtime/local-stt.env.example`.
+Important defaults:
+- `HERMES_LOCAL_STT_MODEL=large-v3-turbo`
+- `HERMES_LOCAL_STT_HOST=127.0.0.1` on single-host Linux, or `0.0.0.0` on the Windows GPU host so the VM can reach it
+- `HERMES_LOCAL_STT_PORT=8177`
+- `HERMES_LOCAL_STT_SERVER_URL=http://127.0.0.1:8177` for same-host use, or `http://WINDOWS_HOST_IP:8177` when Hermes runs in the VM and the runtime runs on Windows
+- `HERMES_LOCAL_STT_COMPUTE_TYPE=int8_float16`
+
 ## Notes
-This repo keeps the feature outside the upstream Hermes repository. Hermes itself only receives the patch from this bundle.
+- This repo keeps the feature outside the upstream Hermes repository.
+- Hermes should use `local_command` for the `discord_voice` runtime profile only.
+- The runtime is intended to load the model once and stay hot for low-latency Discord voice usage.
