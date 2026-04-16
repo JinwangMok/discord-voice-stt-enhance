@@ -1,0 +1,884 @@
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index 51a8780a..a8fb967f 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -10,6 +10,7 @@ Uses discord.py library for:
+ """
+ 
+ import asyncio
++from array import array
+ import logging
+ import os
+ import struct
+@@ -91,6 +92,10 @@ class VoiceReceiver:
+ 
+     SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
+     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
++    MIN_BUFFER_RMS = 120       # reject near-silent noise bursts
++    MIN_BUFFER_PEAK = 250      # reject buffers with no meaningful peak energy
++    VOICED_FRAME_RMS = 180     # 20ms frame RMS threshold for speech-like energy
++    MIN_VOICED_FRAME_RATIO = 0.2
+     SAMPLE_RATE = 48000        # Discord native rate
+     CHANNELS = 2               # Discord sends stereo
+ 
+@@ -357,6 +362,11 @@ class VoiceReceiver:
+                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+ 
+                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
++                    if not self._buffer_has_speech_characteristics(bytes(buf)):
++                        self._buffers[ssrc] = bytearray()
++                        self._last_packet_time.pop(ssrc, None)
++                        continue
++
+                     user_id = ssrc_user_map.get(ssrc, 0)
+                     if not user_id:
+                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
+@@ -373,6 +383,59 @@ class VoiceReceiver:
+ 
+         return completed
+ 
++    def _buffer_has_speech_characteristics(self, pcm_data: bytes) -> bool:
++        """Return whether a completed PCM buffer looks speech-like enough for STT."""
++        if len(pcm_data) < 4:
++            return False
++
++        rms, peak = self._pcm_level_stats(pcm_data)
++        if peak < self.MIN_BUFFER_PEAK:
++            return False
++        if rms >= self.MIN_BUFFER_RMS:
++            return True
++
++        frame_bytes = int(self.SAMPLE_RATE * self.CHANNELS * 2 * 0.02)
++        if frame_bytes <= 0:
++            return False
++
++        voiced_frames = 0
++        total_frames = 0
++        for start in range(0, len(pcm_data), frame_bytes):
++            frame = pcm_data[start:start + frame_bytes]
++            if len(frame) < 4:
++                continue
++            total_frames += 1
++            frame_rms, _ = self._pcm_level_stats(frame)
++            if frame_rms >= self.VOICED_FRAME_RMS:
++                voiced_frames += 1
++
++        if total_frames == 0:
++            return False
++        return (voiced_frames / total_frames) >= self.MIN_VOICED_FRAME_RATIO
++
++    @staticmethod
++    def _pcm_level_stats(pcm_data: bytes) -> tuple[float, int]:
++        """Return RMS and peak amplitude for signed 16-bit PCM."""
++        usable = len(pcm_data) - (len(pcm_data) % 2)
++        if usable < 2:
++            return 0.0, 0
++
++        samples = array("h")
++        samples.frombytes(pcm_data[:usable])
++        if not samples:
++            return 0.0, 0
++
++        peak = 0
++        total = 0
++        for sample in samples:
++            magnitude = abs(int(sample))
++            if magnitude > peak:
++                peak = magnitude
++            total += magnitude * magnitude
++
++        rms = (total / len(samples)) ** 0.5
++        return rms, peak
++
+     # ------------------------------------------------------------------
+     # PCM -> WAV conversion (for Whisper STT)
+     # ------------------------------------------------------------------
+@@ -445,6 +508,10 @@ class DiscordAdapter(BasePlatformAdapter):
+         # Phase 2: voice listening
+         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
+         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
++        self._voice_processing_queues: Dict[int, asyncio.Queue] = {}  # guild_id -> FIFO utterance queue
++        self._voice_processing_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> worker task
++        self._voice_processing_seq: Dict[int, int] = {}  # guild_id -> enqueue sequence
++        self._voice_session_generation: Dict[int, int] = {}  # guild_id -> session token
+         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+         # Track threads where the bot has participated so follow-up messages
+@@ -1019,8 +1086,10 @@ class DiscordAdapter(BasePlatformAdapter):
+             receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+             receiver.start()
+             self._voice_receivers[guild_id] = receiver
++            session_generation = self._voice_session_generation.get(guild_id, 0) + 1
++            self._voice_session_generation[guild_id] = session_generation
+             self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+-                self._voice_listen_loop(guild_id)
++                self._voice_listen_loop(guild_id, session_generation)
+             )
+         except Exception as e:
+             logger.warning("Voice receiver failed to start: %s", e)
+@@ -1029,25 +1098,47 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+     async def leave_voice_channel(self, guild_id: int) -> None:
+         """Disconnect from the voice channel in a guild."""
+-        # Stop voice receiver first
+-        receiver = self._voice_receivers.pop(guild_id, None)
++        self._voice_session_generation[guild_id] = self._voice_session_generation.get(guild_id, 0) + 1
++
++        receiver = self._voice_receivers.get(guild_id)
+         if receiver:
+             receiver.stop()
++
+         listen_task = self._voice_listen_tasks.pop(guild_id, None)
+         if listen_task:
+             listen_task.cancel()
++            if asyncio.isfuture(listen_task) or isinstance(listen_task, asyncio.Task):
++                try:
++                    await listen_task
++                except asyncio.CancelledError:
++                    pass
++
++        worker_task = self._voice_processing_tasks.pop(guild_id, None)
++        if worker_task:
++            worker_task.cancel()
++            if asyncio.isfuture(worker_task) or isinstance(worker_task, asyncio.Task):
++                try:
++                    await worker_task
++                except asyncio.CancelledError:
++                    pass
+ 
+         vc = self._voice_clients.pop(guild_id, None)
+         if vc and vc.is_connected():
+             await vc.disconnect()
++
+         task = self._voice_timeout_tasks.pop(guild_id, None)
+         if task:
+             task.cancel()
++
++        self._voice_receivers.pop(guild_id, None)
++        self._voice_processing_queues.pop(guild_id, None)
++        self._voice_processing_seq.pop(guild_id, None)
+         self._voice_text_channels.pop(guild_id, None)
+         self._voice_sources.pop(guild_id, None)
+ 
+     # Maximum seconds to wait for voice playback before giving up
+     PLAYBACK_TIMEOUT = 120
++    VOICE_PROCESSING_MAX_QUEUE = 8
+ 
+     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+         """Play an audio file in the connected voice channel."""
+@@ -1213,18 +1304,83 @@ class DiscordAdapter(BasePlatformAdapter):
+     # Voice listening (Phase 2)
+     # ------------------------------------------------------------------
+ 
+-    # UDP keepalive interval in seconds — prevents Discord from dropping
+-    # the UDP route after ~60s of silence.
++    # Send silence-frame UDP keepalive this often (seconds) to prevent
++    # Discord from dropping the UDP route after ~60s of silence.
+     _KEEPALIVE_INTERVAL = 15
+ 
+-    async def _voice_listen_loop(self, guild_id: int):
+-        """Periodically check for completed utterances and process them."""
++    def _ensure_voice_processing_worker(self, guild_id: int) -> asyncio.Queue:
++        queue = self._voice_processing_queues.get(guild_id)
++        if queue is None:
++            queue = asyncio.Queue(maxsize=self.VOICE_PROCESSING_MAX_QUEUE)
++            self._voice_processing_queues[guild_id] = queue
++
++        worker = self._voice_processing_tasks.get(guild_id)
++        if worker is None or worker.done():
++            self._voice_processing_tasks[guild_id] = asyncio.ensure_future(
++                self._voice_processing_worker(guild_id)
++            )
++        return queue
++
++    async def _enqueue_voice_utterance(
++        self,
++        guild_id: int,
++        user_id: int,
++        pcm_data: bytes,
++        *,
++        session_generation: Optional[int] = None,
++    ) -> None:
++        current_generation = self._voice_session_generation.get(guild_id, 0)
++        if session_generation is not None and session_generation != current_generation:
++            return
++        if guild_id not in self._voice_clients:
++            return
++
++        queue = self._ensure_voice_processing_worker(guild_id)
++        seq = self._voice_processing_seq.get(guild_id, 0) + 1
++        self._voice_processing_seq[guild_id] = seq
++        try:
++            queue.put_nowait((seq, user_id, pcm_data, current_generation))
++        except asyncio.QueueFull:
++            logger.warning(
++                "Dropping voice utterance because processing queue is full (guild=%d, max=%d)",
++                guild_id,
++                queue.maxsize,
++            )
++
++    async def _voice_processing_worker(self, guild_id: int) -> None:
++        queue = self._voice_processing_queues.get(guild_id)
++        if queue is None:
++            return
++
++        while True:
++            seq, user_id, pcm_data, session_generation = await queue.get()
++            try:
++                if session_generation != self._voice_session_generation.get(guild_id, 0):
++                    continue
++                if guild_id not in self._voice_clients:
++                    continue
++                await self._process_voice_input(guild_id, user_id, pcm_data)
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                logger.warning(
++                    "Voice processing worker failed (guild=%d seq=%d): %s",
++                    guild_id,
++                    seq,
++                    e,
++                    exc_info=True,
++                )
++            finally:
++                queue.task_done()
++
++    async def _voice_listen_loop(self, guild_id: int, session_generation: int):
++        """Periodically check for completed utterances and enqueue them for processing."""
+         receiver = self._voice_receivers.get(guild_id)
+         if not receiver:
+             return
+         last_keepalive = time.monotonic()
+         try:
+-            while receiver._running:
++            while receiver._running and self._voice_session_generation.get(guild_id, 0) == session_generation:
+                 await asyncio.sleep(0.2)
+ 
+                 # Send periodic UDP keepalive to prevent Discord from
+@@ -1243,7 +1399,12 @@ class DiscordAdapter(BasePlatformAdapter):
+                 for user_id, pcm_data in completed:
+                     if not self._is_allowed_user(str(user_id)):
+                         continue
+-                    await self._process_voice_input(guild_id, user_id, pcm_data)
++                    await self._enqueue_voice_utterance(
++                        guild_id,
++                        user_id,
++                        pcm_data,
++                        session_generation=session_generation,
++                    )
+         except asyncio.CancelledError:
+             pass
+         except Exception as e:
+@@ -1260,13 +1421,15 @@ class DiscordAdapter(BasePlatformAdapter):
+             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
+ 
+             from tools.transcription_tools import transcribe_audio
+-            result = await asyncio.to_thread(transcribe_audio, wav_path)
++            result = await asyncio.to_thread(transcribe_audio, wav_path, profile="discord_voice")
+ 
+             if not result.get("success"):
+                 return
+             transcript = result.get("transcript", "").strip()
+             if not transcript or is_whisper_hallucination(transcript):
+                 return
++            if self._is_low_confidence_voice_transcript(transcript):
++                return
+ 
+             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+ 
+@@ -1284,6 +1447,11 @@ class DiscordAdapter(BasePlatformAdapter):
+             except OSError:
+                 pass
+ 
++    def _is_low_confidence_voice_transcript(self, transcript: str) -> bool:
++        """Reject obviously non-speech transcripts before they reach the agent."""
++        normalized = re.sub(r"[\W_]+", "", transcript, flags=re.UNICODE)
++        return not normalized
++
+     def _is_allowed_user(self, user_id: str) -> bool:
+         """Check if user is in DISCORD_ALLOWED_USERS."""
+         if not self._allowed_user_ids:
+diff --git a/tests/gateway/test_voice_command.py b/tests/gateway/test_voice_command.py
+index f0c3171d..85cdd539 100644
+--- a/tests/gateway/test_voice_command.py
++++ b/tests/gateway/test_voice_command.py
+@@ -1,9 +1,12 @@
+ """Tests for the /voice command and auto voice reply in the gateway."""
+ 
++import asyncio
++import contextlib
+ import importlib.util
+ import json
+ import os
+ import queue
++import struct
+ import sys
+ import threading
+ import time
+@@ -421,6 +424,10 @@ class TestDiscordPlayTtsSkip:
+         adapter._voice_timeout_tasks = {}
+         adapter._voice_receivers = {}
+         adapter._voice_listen_tasks = {}
++        adapter._voice_processing_queues = {}
++        adapter._voice_processing_tasks = {}
++        adapter._voice_processing_seq = {}
++        adapter._voice_session_generation = {}
+         adapter._client = None
+         adapter._broadcast = AsyncMock()
+         return adapter
+@@ -506,6 +513,11 @@ class TestVoiceReceiver:
+         receiver = VoiceReceiver(mock_vc)
+         return receiver
+ 
++    @staticmethod
++    def _speechy_pcm(size_bytes: int, amplitude: int = 1200) -> bytearray:
++        sample = struct.pack("<h", amplitude)
++        return bytearray(sample * (size_bytes // 2))
++
+     def test_initial_state(self):
+         receiver = self._make_receiver()
+         assert receiver._running is False
+@@ -558,7 +570,7 @@ class TestVoiceReceiver:
+         receiver.map_ssrc(100, 42)
+         # 48kHz, stereo, 16-bit = 192000 bytes/sec
+         # MIN_SPEECH_DURATION = 0.5s → need 96000 bytes
+-        pcm_data = bytearray(b"\x00" * 96000)
++        pcm_data = self._speechy_pcm(96000)
+         receiver._buffers[100] = pcm_data
+         # Set last_packet_time far enough in the past to exceed SILENCE_THRESHOLD
+         receiver._last_packet_time[100] = time.monotonic() - 3.0
+@@ -579,10 +591,20 @@ class TestVoiceReceiver:
+         completed = receiver.check_silence()
+         assert len(completed) == 0
+ 
++    def test_check_silence_ignores_low_energy_buffer(self):
++        receiver = self._make_receiver()
++        receiver.map_ssrc(100, 42)
++        quiet_sample = struct.pack("<h", 8)
++        # 48kHz stereo 0.5s = 96000 bytes, all near-silence amplitude
++        receiver._buffers[100] = bytearray(quiet_sample * (96000 // 2))
++        receiver._last_packet_time[100] = time.monotonic() - 3.0
++        completed = receiver.check_silence()
++        assert completed == []
++
+     def test_check_silence_ignores_recent_audio(self):
+         receiver = self._make_receiver()
+         receiver.map_ssrc(100, 42)
+-        receiver._buffers[100] = bytearray(b"\x00" * 96000)
++        receiver._buffers[100] = self._speechy_pcm(96000)
+         receiver._last_packet_time[100] = time.monotonic()  # just now
+         completed = receiver.check_silence()
+         assert len(completed) == 0
+@@ -590,7 +612,7 @@ class TestVoiceReceiver:
+     def test_check_silence_unknown_user_discarded(self):
+         receiver = self._make_receiver()
+         # No SSRC mapping — user_id will be 0
+-        receiver._buffers[100] = bytearray(b"\x00" * 96000)
++        receiver._buffers[100] = self._speechy_pcm(96000)
+         receiver._last_packet_time[100] = time.monotonic() - 3.0
+         completed = receiver.check_silence()
+         assert len(completed) == 0
+@@ -936,6 +958,10 @@ class TestDiscordVoiceChannelMethods:
+         adapter._voice_timeout_tasks = {}
+         adapter._voice_receivers = {}
+         adapter._voice_listen_tasks = {}
++        adapter._voice_processing_queues = {}
++        adapter._voice_processing_tasks = {}
++        adapter._voice_processing_seq = {}
++        adapter._voice_session_generation = {}
+         adapter._voice_input_callback = None
+         adapter._allowed_user_ids = set()
+         adapter._running = True
+@@ -968,6 +994,9 @@ class TestDiscordVoiceChannelMethods:
+         adapter._voice_clients[111] = mock_vc
+         adapter._voice_text_channels[111] = 123
+         adapter._voice_sources[111] = {"chat_id": "123", "chat_type": "group"}
++        adapter._voice_processing_queues[111] = asyncio.Queue()
++        adapter._voice_processing_seq[111] = 3
++        adapter._voice_session_generation[111] = 7
+ 
+         mock_receiver = MagicMock()
+         adapter._voice_receivers[111] = mock_receiver
+@@ -975,6 +1004,9 @@ class TestDiscordVoiceChannelMethods:
+         mock_task = MagicMock()
+         adapter._voice_listen_tasks[111] = mock_task
+ 
++        mock_worker = MagicMock()
++        adapter._voice_processing_tasks[111] = mock_worker
++
+         mock_timeout = MagicMock()
+         adapter._voice_timeout_tasks[111] = mock_timeout
+ 
+@@ -982,12 +1014,77 @@ class TestDiscordVoiceChannelMethods:
+ 
+         mock_receiver.stop.assert_called_once()
+         mock_task.cancel.assert_called_once()
++        mock_worker.cancel.assert_called_once()
+         mock_vc.disconnect.assert_called_once()
+         mock_timeout.cancel.assert_called_once()
+         assert 111 not in adapter._voice_clients
+         assert 111 not in adapter._voice_text_channels
+         assert 111 not in adapter._voice_sources
+         assert 111 not in adapter._voice_receivers
++        assert 111 not in adapter._voice_processing_queues
++        assert 111 not in adapter._voice_processing_seq
++        assert adapter._voice_session_generation[111] == 8
++
++    @pytest.mark.asyncio
++    async def test_enqueue_voice_utterance_rejects_stale_session(self):
++        adapter = self._make_adapter()
++        adapter._voice_clients[111] = MagicMock()
++        adapter._voice_session_generation[111] = 2
++
++        await adapter._enqueue_voice_utterance(111, 42, b"pcm", session_generation=1)
++
++        assert 111 not in adapter._voice_processing_queues
++        assert 111 not in adapter._voice_processing_tasks
++
++    @pytest.mark.asyncio
++    async def test_enqueue_voice_utterance_drops_when_queue_full(self):
++        adapter = self._make_adapter()
++        adapter._voice_clients[111] = MagicMock()
++        adapter._voice_session_generation[111] = 1
++        queue = asyncio.Queue(maxsize=1)
++        queue.put_nowait((1, 42, b"old", 1))
++        adapter._voice_processing_queues[111] = queue
++        worker = MagicMock()
++        worker.done.return_value = False
++        adapter._voice_processing_tasks[111] = worker
++
++        await adapter._enqueue_voice_utterance(111, 42, b"new", session_generation=1)
++
++        assert queue.qsize() == 1
++        assert adapter._voice_processing_seq[111] == 1
++
++    @pytest.mark.asyncio
++    async def test_voice_processing_worker_preserves_fifo_order(self):
++        adapter = self._make_adapter()
++        adapter._voice_clients[111] = MagicMock()
++        adapter._voice_session_generation[111] = 1
++
++        started = asyncio.Event()
++        release = asyncio.Event()
++        order = []
++
++        async def fake_process(guild_id, user_id, pcm_data):
++            order.append(pcm_data)
++            if pcm_data == b"first":
++                started.set()
++                await release.wait()
++
++        adapter._process_voice_input = fake_process
++
++        await adapter._enqueue_voice_utterance(111, 42, b"first", session_generation=1)
++        await adapter._enqueue_voice_utterance(111, 42, b"second", session_generation=1)
++
++        await asyncio.wait_for(started.wait(), timeout=1)
++        assert order == [b"first"]
++
++        release.set()
++        worker = adapter._voice_processing_tasks[111]
++        await asyncio.wait_for(adapter._voice_processing_queues[111].join(), timeout=1)
++        worker.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await worker
++
++        assert order == [b"first", b"second"]
+ 
+     @pytest.mark.asyncio
+     async def test_leave_voice_channel_no_connection(self):
+@@ -1065,11 +1162,12 @@ class TestDiscordVoiceChannelMethods:
+ 
+         with patch("gateway.platforms.discord.VoiceReceiver.pcm_to_wav"), \
+              patch("tools.transcription_tools.transcribe_audio",
+-                   return_value={"success": True, "transcript": "Hello"}), \
++                   return_value={"success": True, "transcript": "Hello"}) as mock_transcribe, \
+              patch("tools.voice_mode.is_whisper_hallucination", return_value=False):
+             await adapter._process_voice_input(111, 42, pcm_data)
+ 
+         callback.assert_called_once_with(guild_id=111, user_id=42, transcript="Hello")
++        assert mock_transcribe.call_args.kwargs["profile"] == "discord_voice"
+ 
+     @pytest.mark.asyncio
+     async def test_process_voice_input_hallucination_filtered(self):
+@@ -1086,6 +1184,21 @@ class TestDiscordVoiceChannelMethods:
+ 
+         callback.assert_not_called()
+ 
++    @pytest.mark.asyncio
++    async def test_process_voice_input_low_confidence_transcript_filtered(self):
++        """Punctuation-only or non-speech transcripts are filtered out."""
++        adapter = self._make_adapter()
++        callback = AsyncMock()
++        adapter._voice_input_callback = callback
++
++        with patch("gateway.platforms.discord.VoiceReceiver.pcm_to_wav"), \
++             patch("tools.transcription_tools.transcribe_audio",
++                   return_value={"success": True, "transcript": "...?!"}), \
++             patch("tools.voice_mode.is_whisper_hallucination", return_value=False):
++            await adapter._process_voice_input(111, 42, b"\x00" * 96000)
++
++        callback.assert_not_called()
++
+     @pytest.mark.asyncio
+     async def test_process_voice_input_stt_failure(self):
+         """STT failure — callback not called."""
+@@ -1717,6 +1830,10 @@ class TestVoiceTimeoutCleansRunnerState:
+         adapter._voice_timeout_tasks = {}
+         adapter._voice_receivers = {}
+         adapter._voice_listen_tasks = {}
++        adapter._voice_processing_queues = {}
++        adapter._voice_processing_tasks = {}
++        adapter._voice_processing_seq = {}
++        adapter._voice_session_generation = {}
+         adapter._voice_input_callback = None
+         adapter._on_voice_disconnect = None
+         adapter._client = None
+@@ -1807,6 +1924,10 @@ class TestPlaybackTimeout:
+         adapter._voice_timeout_tasks = {}
+         adapter._voice_receivers = {}
+         adapter._voice_listen_tasks = {}
++        adapter._voice_processing_queues = {}
++        adapter._voice_processing_tasks = {}
++        adapter._voice_processing_seq = {}
++        adapter._voice_session_generation = {}
+         adapter._voice_input_callback = None
+         adapter._on_voice_disconnect = None
+         adapter._client = None
+@@ -2134,10 +2255,11 @@ class TestVoiceReception:
+         return receiver
+ 
+     @staticmethod
+-    def _fill_buffer(receiver, ssrc, duration_s=1.0, age_s=3.0):
+-        """Add PCM data to buffer. 48kHz stereo 16-bit = 192000 bytes/sec."""
++    def _fill_buffer(receiver, ssrc, duration_s=1.0, age_s=3.0, amplitude=1200):
++        """Add speech-like PCM data to buffer. 48kHz stereo 16-bit = 192000 bytes/sec."""
+         size = int(192000 * duration_s)
+-        receiver._buffers[ssrc] = bytearray(b"\x00" * size)
++        sample = struct.pack("<h", amplitude)
++        receiver._buffers[ssrc] = bytearray(sample * (size // 2))
+         receiver._last_packet_time[ssrc] = time.monotonic() - age_s
+ 
+     # -- Known SSRC (normal flow) --
+@@ -2637,6 +2759,10 @@ class TestUDPKeepalive:
+         adapter._voice_sources = {}
+         adapter._voice_receivers = {}
+         adapter._voice_listen_tasks = {}
++        adapter._voice_processing_queues = {}
++        adapter._voice_processing_tasks = {}
++        adapter._voice_processing_seq = {}
++        adapter._voice_session_generation = {111: 1}
+ 
+         # Mock VC and receiver
+         mock_vc = MagicMock()
+@@ -2664,7 +2790,7 @@ class TestUDPKeepalive:
+         try:
+             # Run listen loop briefly
+             import asyncio
+-            loop_task = asyncio.create_task(adapter._voice_listen_loop(111))
++            loop_task = asyncio.create_task(adapter._voice_listen_loop(111, 1))
+             await asyncio.sleep(0.3)
+             receiver._running = False  # stop loop
+             await asyncio.sleep(0.1)
+diff --git a/tests/tools/test_managed_media_gateways.py b/tests/tools/test_managed_media_gateways.py
+index ecbf71c2..c7261a30 100644
+--- a/tests/tools/test_managed_media_gateways.py
++++ b/tests/tools/test_managed_media_gateways.py
+@@ -250,6 +250,33 @@ def test_openai_tts_accepts_openai_api_key_as_direct_fallback(monkeypatch, tmp_p
+     assert captured["close_calls"] == 1
+ 
+ 
++def test_openai_tts_accepts_configured_api_key_and_base_url(monkeypatch, tmp_path):
++    captured = {}
++    _install_fake_tools_package()
++    _install_fake_openai_module(captured)
++    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
++    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
++    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")
++    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
++
++    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
++    output_path = tmp_path / "speech.mp3"
++    tts_tool._generate_openai_tts(
++        "hello world",
++        str(output_path),
++        {
++            "openai": {
++                "api_key": "config-key",
++                "base_url": "http://10.40.40.40/tts/v1",
++            }
++        },
++    )
++
++    assert captured["api_key"] == "config-key"
++    assert captured["base_url"] == "http://10.40.40.40/tts/v1"
++    assert captured["close_calls"] == 1
++
++
+ def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_path):
+     whisper_capture = {}
+     _install_fake_tools_package()
+diff --git a/tests/tools/test_transcription_tools.py b/tests/tools/test_transcription_tools.py
+index effd4e1a..7cd08fb7 100644
+--- a/tests/tools/test_transcription_tools.py
++++ b/tests/tools/test_transcription_tools.py
+@@ -816,6 +816,46 @@ class TestTranscribeAudioDispatch:
+ 
+         assert mock_openai.call_args[0][1] == "gpt-4o-transcribe"
+ 
++    def test_discord_voice_profile_prefers_openai_and_uses_voice_model(self, sample_ogg):
++        config = {
++            "provider": "local",
++            "local": {"model": "base"},
++            "discord_voice": {},
++            "openai": {},
++        }
++        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
++             patch("tools.transcription_tools._HAS_OPENAI", True), \
++             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
++             patch("tools.transcription_tools._has_openai_audio_backend", return_value=True), \
++             patch("tools.transcription_tools._transcribe_openai",
++                   return_value={"success": True, "transcript": "hi", "provider": "openai"}) as mock_openai:
++            from tools.transcription_tools import transcribe_audio
++            result = transcribe_audio(sample_ogg, profile="discord_voice")
++
++        assert result["success"] is True
++        assert result["provider"] == "openai"
++        assert mock_openai.call_args[0][1] == "gpt-4o-mini-transcribe"
++
++    def test_discord_voice_profile_prefers_groq_before_local(self, monkeypatch, sample_ogg):
++        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
++        config = {
++            "provider": "local",
++            "local": {"model": "base"},
++            "discord_voice": {},
++        }
++        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
++             patch("tools.transcription_tools._HAS_OPENAI", True), \
++             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
++             patch("tools.transcription_tools._has_openai_audio_backend", return_value=False), \
++             patch("tools.transcription_tools._transcribe_groq",
++                   return_value={"success": True, "transcript": "hi", "provider": "groq"}) as mock_groq:
++            from tools.transcription_tools import transcribe_audio
++            result = transcribe_audio(sample_ogg, profile="discord_voice")
++
++        assert result["success"] is True
++        assert result["provider"] == "groq"
++        assert mock_groq.call_args[0][1] == "whisper-large-v3-turbo"
++
+ 
+ # ============================================================================
+ # _transcribe_mistral
+diff --git a/tools/transcription_tools.py b/tools/transcription_tools.py
+index 3fdf0cc0..f4c1503a 100644
+--- a/tools/transcription_tools.py
++++ b/tools/transcription_tools.py
+@@ -23,6 +23,7 @@ Usage::
+         print(result["transcript"])
+ """
+ 
++import copy
+ import logging
+ import os
+ import shlex
+@@ -67,6 +68,8 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
+ DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
+ DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
+ DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
++DEFAULT_DISCORD_VOICE_OPENAI_MODEL = os.getenv("STT_DISCORD_VOICE_OPENAI_MODEL", "gpt-4o-mini-transcribe")
++DEFAULT_DISCORD_VOICE_LOCAL_MODEL = os.getenv("STT_DISCORD_VOICE_LOCAL_MODEL", "small")
+ LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
+ LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
+ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+@@ -101,6 +104,45 @@ def _load_stt_config() -> dict:
+         return {}
+ 
+ 
++def _merge_stt_dicts(base: dict, overlay: dict) -> dict:
++    """Recursively merge STT config dicts without mutating the inputs."""
++    result = copy.deepcopy(base)
++    for key, value in overlay.items():
++        if isinstance(value, dict) and isinstance(result.get(key), dict):
++            result[key] = _merge_stt_dicts(result[key], value)
++        else:
++            result[key] = copy.deepcopy(value)
++    return result
++
++
++def _resolve_stt_runtime_config(stt_config: Optional[dict], profile: Optional[str] = None) -> dict:
++    """Return the effective STT config for the requested runtime profile."""
++    config = copy.deepcopy(stt_config or {})
++    if not profile:
++        return config
++
++    profile_cfg = config.get(profile, {})
++    if isinstance(profile_cfg, dict) and profile_cfg:
++        config = _merge_stt_dicts(config, profile_cfg)
++
++    if profile == "discord_voice":
++        if "provider" not in profile_cfg:
++            config["provider"] = "auto"
++        config["_auto_strategy"] = "quality"
++
++        openai_cfg = config.setdefault("openai", {})
++        if not openai_cfg.get("model"):
++            openai_cfg["model"] = DEFAULT_DISCORD_VOICE_OPENAI_MODEL
++
++        local_cfg = config.setdefault("local", {})
++        if not local_cfg.get("model") or local_cfg.get("model") == DEFAULT_LOCAL_MODEL:
++            local_cfg["model"] = DEFAULT_DISCORD_VOICE_LOCAL_MODEL
++        if "language" not in local_cfg:
++            local_cfg["language"] = ""
++
++    return config
++
++
+ def is_stt_enabled(stt_config: Optional[dict] = None) -> bool:
+     """Return whether STT is enabled in config."""
+     if stt_config is None:
+@@ -165,13 +207,15 @@ def _get_provider(stt_config: dict) -> str:
+ 
+     When ``stt.provider`` is explicitly set in config, that choice is
+     honoured — no silent cloud fallback.  When no provider is configured,
+-    auto-detect tries: local > groq (free) > openai (paid).
++    auto-detect tries local-first by default, or cloud-first for quality-
++    oriented runtime profiles such as Discord voice channels.
+     """
+     if not is_stt_enabled(stt_config):
+         return "none"
+ 
+-    explicit = "provider" in stt_config
+-    provider = stt_config.get("provider", DEFAULT_PROVIDER)
++    provider = (stt_config.get("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
++    explicit = "provider" in stt_config and provider != "auto"
++    auto_strategy = stt_config.get("_auto_strategy", "default")
+ 
+     # --- Explicit provider: respect the user's choice ----------------------
+ 
+@@ -225,7 +269,23 @@ def _get_provider(stt_config: dict) -> str:
+ 
+         return provider  # Unknown — let it fail downstream
+ 
+-    # --- Auto-detect (no explicit provider): local > groq > openai > mistral -
++    # --- Auto-detect -------------------------------------------------------
++
++    if auto_strategy == "quality":
++        if _HAS_OPENAI and _has_openai_audio_backend():
++            logger.info("Quality-first STT auto-detect selected OpenAI transcription")
++            return "openai"
++        if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
++            logger.info("Quality-first STT auto-detect selected Groq transcription")
++            return "groq"
++        if _HAS_MISTRAL and os.getenv("MISTRAL_API_KEY"):
++            logger.info("Quality-first STT auto-detect selected Mistral transcription")
++            return "mistral"
++        if _HAS_FASTER_WHISPER:
++            return "local"
++        if _has_local_command():
++            return "local_command"
++        return "none"
+ 
+     if _HAS_FASTER_WHISPER:
+         return "local"
+@@ -559,7 +619,11 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
++def transcribe_audio(
++    file_path: str,
++    model: Optional[str] = None,
++    profile: Optional[str] = None,
++) -> Dict[str, Any]:
+     """
+     Transcribe an audio file using the configured STT provider.
+ 
+@@ -570,6 +634,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
+     Args:
+         file_path: Absolute path to the audio file to transcribe.
+         model:     Override the model. If None, uses config or provider default.
++        profile:   Optional runtime STT profile (e.g. ``discord_voice``).
+ 
+     Returns:
+         dict with keys:
+@@ -584,14 +649,15 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
+         return error
+ 
+     # Load config and determine provider
+-    stt_config = _load_stt_config()
+-    if not is_stt_enabled(stt_config):
++    base_stt_config = _load_stt_config()
++    if not is_stt_enabled(base_stt_config):
+         return {
+             "success": False,
+             "transcript": "",
+             "error": "STT is disabled in config.yaml (stt.enabled: false).",
+         }
+ 
++    stt_config = _resolve_stt_runtime_config(base_stt_config, profile=profile)
+     provider = _get_provider(stt_config)
+ 
+     if provider == "local":
+@@ -607,7 +673,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
+         return _transcribe_local_command(file_path, model_name)
+ 
+     if provider == "groq":
+-        model_name = model or DEFAULT_GROQ_STT_MODEL
++        groq_cfg = stt_config.get("groq", {})
++        model_name = model or groq_cfg.get("model", DEFAULT_GROQ_STT_MODEL)
+         return _transcribe_groq(file_path, model_name)
+ 
+     if provider == "openai":
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index 769ae30a..f347668b 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -261,7 +261,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
+     Returns:
+         Path to the saved audio file.
+     """
+-    api_key, base_url = _resolve_openai_audio_client_config()
++    api_key, base_url = _resolve_openai_audio_client_config(tts_config)
+ 
+     oai_config = tts_config.get("openai", {})
+     model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
+@@ -743,15 +743,21 @@ def check_tts_requirements() -> bool:
+     return False
+ 
+ 
+-def _resolve_openai_audio_client_config() -> tuple[str, str]:
+-    """Return direct OpenAI audio config or a managed gateway fallback."""
++def _resolve_openai_audio_client_config(tts_config: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
++    """Return config-driven OpenAI audio config or a managed gateway fallback."""
++    openai_cfg = (tts_config or {}).get("openai", {})
++    cfg_api_key = str(openai_cfg.get("api_key", "") or "").strip()
++    cfg_base_url = str(openai_cfg.get("base_url", "") or "").strip()
++    if cfg_api_key:
++        return cfg_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL)
++
+     direct_api_key = resolve_openai_audio_api_key()
+     if direct_api_key:
+         return direct_api_key, DEFAULT_OPENAI_BASE_URL
+ 
+     managed_gateway = resolve_managed_tool_gateway("openai-audio")
+     if managed_gateway is None:
+-        message = "Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set"
++        message = "Neither tts.openai.api_key in config nor VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
+         if managed_nous_tools_enabled():
+             message += ", and the managed OpenAI audio gateway is unavailable"
+         raise ValueError(message)
+@@ -762,8 +768,12 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
+ 
+ 
+ def _has_openai_audio_backend() -> bool:
+-    """Return True when OpenAI audio can use direct credentials or the managed gateway."""
+-    return bool(resolve_openai_audio_api_key() or resolve_managed_tool_gateway("openai-audio"))
++    """Return True when OpenAI audio can use config credentials, env credentials, or the managed gateway."""
++    try:
++        _resolve_openai_audio_client_config(_load_tts_config())
++        return True
++    except ValueError:
++        return False
+ 
+ 
+ # ===========================================================================
