@@ -28,14 +28,17 @@ This repo now also owns the local STT runtime pieces:
    - per-guild FIFO processing queue
    - teardown-safe session generation token
    - bounded queue to avoid unbounded backlog
-3. **Discord voice STT profile**
+3. **STT routing simplification**
+   - Hermes can now be configured to use `provider: local_command` globally, not only for `discord_voice`.
+   - `tools/transcription_tools.py` accepts `stt.local_command.command` from config before falling back to `HERMES_LOCAL_STT_COMMAND`.
+4. **Discord voice STT profile**
    - `transcribe_audio(..., profile="discord_voice")`
    - quality-first provider ordering for live voice
-   - can now be configured to use `provider: local_command` for Discord voice only
-4. **Noise admission filtering**
+   - can still be configured to use `provider: local_command` for Discord voice only
+5. **Noise admission filtering**
    - PCM energy/peak/voiced-ratio screening before STT
    - punctuation-only transcript rejection after STT
-5. **Local stronger-model runtime**
+6. **Local stronger-model runtime**
    - intended default model: `large-v3-turbo`
    - model stays hot in a local HTTP service for lower latency than one-shot CLI loads
    - Hermes remains only a caller, not the runtime owner

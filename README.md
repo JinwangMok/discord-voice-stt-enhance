@@ -13,9 +13,10 @@ Patch bundle and local runtime repo for Hermes Discord voice-channel STT/TTS imp
 - Keep upstream Hermes clean
 - Keep Discord voice STT/TTS custom work in this external repo
 - Run `large-v3-turbo` on the machine that actually has GPU access
-- Point Hermes `discord_voice` profile at `provider: local_command`
+- Point Hermes STT at `provider: local_command`
 - Let Hermes call `runtime/client.py`, which POSTs to the configured runtime URL
-- If Hermes runs in a Linux VM without GPU passthrough, host the STT runtime on the Windows 11 machine and set `HERMES_LOCAL_STT_SERVER_URL` to that host's reachable IP/port
+- Prefer config-first command wiring so the gateway does not depend on `HERMES_LOCAL_STT_*` being present in the service environment
+- If Hermes runs in a Linux VM without GPU passthrough, host the STT runtime on the Windows 11 machine and set the client `--server-url` to that host's reachable IP/port
 
 ## Repo layout
 - `patches/hermes-discord-voice-stt-enhance.patch` — Hermes patch to apply inside Hermes
@@ -80,10 +81,11 @@ runtime\healthcheck-windows.bat
 cd ~/workspace/discord-voice-stt-enhance
 HERMES_LOCAL_STT_SERVER_URL=http://WINDOWS_HOST_IP:8177 ./scripts/configure-hermes-local-stt.sh
 ```
-Copy the printed env into `~/.hermes/.env` and the YAML into `~/.hermes/config.yaml`.
+Copy the printed YAML into `~/.hermes/config.yaml`.
+The printed `.env` lines are optional fallback only; config-first mode can work without them.
 
 If Hermes and the STT runtime are on the same Linux machine, you can keep the default `http://127.0.0.1:8177`.
-If Hermes is in a Linux VM and the STT runtime is on the Windows GPU host, replace `WINDOWS_HOST_IP` with the Windows host IP reachable from the VM.
+If Hermes is in a Linux VM and the STT runtime runs on Windows, replace `WINDOWS_HOST_IP` with the Windows host IP reachable from the VM.
 
 ### 6) Optional: install as user systemd service
 ```bash

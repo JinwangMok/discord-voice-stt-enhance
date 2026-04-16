@@ -1,0 +1,129 @@
+--- a/tools/transcription_tools.py
++++ b/tools/transcription_tools.py
+@@ -177,7 +177,13 @@
+     return _find_binary("whisper")
+ 
+ 
+-def _get_local_command_template() -> Optional[str]:
++def _get_local_command_template(stt_config: Optional[dict] = None) -> Optional[str]:
++    command_cfg = (stt_config or {}).get("local_command", {})
++    if isinstance(command_cfg, dict):
++        configured = str(command_cfg.get("command", "") or "").strip()
++        if configured:
++            return configured
++
+     configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+     if configured:
+         return configured
+@@ -192,8 +198,8 @@
+     return None
+ 
+ 
+-def _has_local_command() -> bool:
+-    return _get_local_command_template() is not None
++def _has_local_command(stt_config: Optional[dict] = None) -> bool:
++    return _get_local_command_template(stt_config) is not None
+ 
+ 
+ def _normalize_local_command_model(model_name: Optional[str]) -> str:
+@@ -223,7 +229,7 @@
+         if provider == "local":
+             if _HAS_FASTER_WHISPER:
+                 return "local"
+-            if _has_local_command():
++            if _has_local_command(stt_config):
+                 return "local_command"
+             logger.warning(
+                 "STT provider 'local' configured but unavailable "
+@@ -232,7 +238,7 @@
+             return "none"
+ 
+         if provider == "local_command":
+-            if _has_local_command():
++            if _has_local_command(stt_config):
+                 return "local_command"
+             if _HAS_FASTER_WHISPER:
+                 logger.info("Local STT command unavailable, using local faster-whisper")
+@@ -283,13 +289,13 @@
+             return "mistral"
+         if _HAS_FASTER_WHISPER:
+             return "local"
+-        if _has_local_command():
++        if _has_local_command(stt_config):
+             return "local_command"
+         return "none"
+ 
+     if _HAS_FASTER_WHISPER:
+         return "local"
+-    if _has_local_command():
++    if _has_local_command(stt_config):
+         return "local_command"
+     if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
+         logger.info("No local STT available, using Groq Whisper API")
+@@ -401,9 +407,9 @@
+         return None, f"Failed to convert audio for local STT: {details}"
+ 
+ 
+-def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]:
++def _transcribe_local_command(file_path: str, model_name: str, stt_config: Optional[dict] = None) -> Dict[str, Any]:
+     """Run the configured local STT command template and read back a .txt transcript."""
+-    command_template = _get_local_command_template()
++    command_template = _get_local_command_template(stt_config)
+     if not command_template:
+         return {
+             "success": False,
+@@ -670,7 +676,7 @@
+         model_name = _normalize_local_command_model(
+             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+         )
+-        return _transcribe_local_command(file_path, model_name)
++        return _transcribe_local_command(file_path, model_name, stt_config)
+ 
+     if provider == "groq":
+         groq_cfg = stt_config.get("groq", {})
+--- a/tests/tools/test_transcription_tools.py
++++ b/tests/tools/test_transcription_tools.py
+@@ -159,6 +159,17 @@
+         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False):
+             from tools.transcription_tools import _get_provider
+             result = _get_provider({"provider": "local"})
++            assert result == "local_command"
++
++    def test_explicit_local_command_uses_config_command(self):
++        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False):
++            from tools.transcription_tools import _get_provider
++            result = _get_provider({
++                "provider": "local_command",
++                "local_command": {
++                    "command": "python runtime/client.py --server-url http://10.31.31.197:8177 --input {input_path} --output-dir {output_dir} --language {language} --model {model}",
++                },
++            })
+             assert result == "local_command"
+ 
+     def test_explicit_groq_no_fallback_to_openai(self, monkeypatch):
+@@ -815,6 +826,25 @@
+             transcribe_audio(sample_ogg, model=None)
+ 
+         assert mock_openai.call_args[0][1] == "gpt-4o-transcribe"
++
++    def test_config_local_command_used_for_global_stt(self, sample_ogg):
++        config = {
++            "provider": "local_command",
++            "local": {"model": "large-v3-turbo"},
++            "local_command": {
++                "command": "python runtime/client.py --server-url http://10.31.31.197:8177 --input {input_path} --output-dir {output_dir} --language {language} --model {model}",
++            },
++        }
++        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
++             patch("tools.transcription_tools._transcribe_local_command",
++                   return_value={"success": True, "transcript": "hi", "provider": "local_command"}) as mock_local_command:
++            from tools.transcription_tools import transcribe_audio
++            result = transcribe_audio(sample_ogg)
++
++        assert result["success"] is True
++        assert result["provider"] == "local_command"
++        assert mock_local_command.call_args[0][1] == "large-v3-turbo"
++        assert mock_local_command.call_args[0][2] == config
+ 
+     def test_discord_voice_profile_prefers_openai_and_uses_voice_model(self, sample_ogg):
+         config = {
