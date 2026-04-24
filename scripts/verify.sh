@@ -3,34 +3,37 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PATCH_PATH="$REPO_DIR/patches/hermes-discord-voice-stt-enhance.patch"
 HERMES_DIR="${1:-/home/jinwang/.hermes/hermes-agent}"
+PYTEST_PYTHON="${HERMES_VERIFY_PYTHON:-}"
+
+if [[ -z "$PYTEST_PYTHON" ]]; then
+  if python3 -c 'import pytest' >/dev/null 2>&1; then
+    PYTEST_PYTHON="python3"
+  elif [[ -x "$HOME/.hermes/hermes-agent/venv/bin/python" ]]; then
+    PYTEST_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python"
+  else
+    echo "Could not find a Python interpreter with pytest installed" >&2
+    exit 1
+  fi
+fi
 
 cd "$REPO_DIR"
-pytest tests/test_runtime_helpers.py -q
-pytest tests/test_service_render.py -q
-python -m py_compile runtime/helpers.py runtime/client.py runtime/server.py service/render.py
+"$PYTEST_PYTHON" -m pytest tests/test_runtime_helpers.py -q
+"$PYTEST_PYTHON" -m pytest tests/test_service_render.py -q
+"$PYTEST_PYTHON" -m py_compile runtime/helpers.py runtime/client.py runtime/server.py service/render.py
 
 echo "Repo unit checks: ok"
 
-if [[ ! -d "$HERMES_DIR/.git" ]]; then
-  echo "Hermes git repo not found: $HERMES_DIR" >&2
-  exit 1
-fi
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+HERMES_LOCAL_STT_SERVER_URL="http://127.0.0.1:8177" "$REPO_DIR/scripts/configure-hermes-local-stt.sh" > "$TMPDIR/config-snippet.txt"
 
-if git -C "$HERMES_DIR" apply --reverse --check "$PATCH_PATH" >/dev/null 2>&1; then
-  echo "Patch state: applied"
-else
-  echo "Patch state: not applied"
-  git -C "$HERMES_DIR" apply --check "$PATCH_PATH"
-  echo "Patch can be applied cleanly"
-fi
+grep -q '^HERMES_LOCAL_STT_SERVER_URL=http://127.0.0.1:8177$' "$TMPDIR/config-snippet.txt"
+grep -q '^HERMES_LOCAL_STT_COMMAND=python ' "$TMPDIR/config-snippet.txt"
+grep -q '^  provider: local_command$' "$TMPDIR/config-snippet.txt"
 
-cd "$HERMES_DIR"
-"$HERMES_DIR/venv/bin/python" -m pytest \
-  tests/tools/test_managed_media_gateways.py -q \
-  tests/tools/test_transcription_tools.py -q \
-  tests/gateway/test_voice_command.py -q \
-  tests/gateway/test_discord_opus.py -q \
-  tests/gateway/test_stt_config.py -q \
-  tests/integration/test_voice_channel_flow.py -q
+echo "Config snippet checks: ok"
+
+if [[ -d "$HERMES_DIR/.git" ]]; then
+  git -C "$HERMES_DIR" status --short --branch
+fi
