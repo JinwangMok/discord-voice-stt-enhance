@@ -1,9 +1,8 @@
 # discord-voice-stt-enhance
 
-Patch bundle and local runtime repo for Hermes Discord voice-channel STT/TTS improvements, packaged outside the main `hermes-agent` repo.
+External runtime/config repo for Hermes Discord voice-channel STT/TTS improvements, packaged outside the main `hermes-agent` repo.
 
 ## What this repo now contains
-- Hermes patch bundle for Discord voice hardening and STT profile behavior
 - Local `faster-whisper` HTTP runtime for `large-v3-turbo`
 - Thin `local_command` client so Hermes can call the local runtime without new Hermes core changes
 - Optional user-level `systemd` service installation for reboot-safe local STT startup
@@ -19,19 +18,19 @@ Patch bundle and local runtime repo for Hermes Discord voice-channel STT/TTS imp
 - If Hermes runs in a Linux VM without GPU passthrough, host the STT runtime on the Windows 11 machine and set the client `--server-url` to that host's reachable IP/port
 
 ## Repo layout
-- `patches/hermes-discord-voice-stt-enhance.patch` — Hermes patch to apply inside Hermes
+- `patches/` — archived historical Hermes patch snapshots (not applied by the current install flow)
 - `runtime/` — local STT HTTP server, thin client, uv-managed env setup, launch/health scripts
 - `service/` — optional user `systemd` service helpers
-- `scripts/` — patch application + Hermes wiring helpers
+- `scripts/` — external repo registration + Hermes wiring helpers
 - `references/` — architecture and operations docs
 - `examples/` — config snippets
 - `tests/` — lightweight unit tests for helper logic in this repo
 
 ## Quick start
 
-### 1) Apply the Hermes patch
+### 1) Register the external repo and print config wiring
 ```bash
-~/workspace/discord-voice-stt-enhance/scripts/install.sh /home/jinwang/.hermes/hermes-agent
+~/workspace/discord-voice-stt-enhance/scripts/install.sh --config /home/jinwang/.hermes/config.yaml
 ```
 
 ### 2) Set up the STT runtime (uv-managed)
@@ -112,5 +111,5 @@ Important defaults:
 
 ## Notes
 - This repo keeps the feature outside the upstream Hermes repository.
-- Hermes should use `local_command` for the `discord_voice` runtime profile only.
+- The current install/verify flow does **not** patch Hermes source files.
 - The runtime is intended to load the model once and stay hot for low-latency Discord voice usage.
