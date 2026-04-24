@@ -34,7 +34,13 @@ for PATCH_PATH in "${ORDERED_PATCHES[@]}"; do
     continue
   fi
 
-  git -C "$HERMES_DIR" apply --check "$PATCH_PATH"
-  git -C "$HERMES_DIR" apply "$PATCH_PATH"
-  echo "Applied patch: $PATCH_PATH"
+  if git -C "$HERMES_DIR" apply --3way --check "$PATCH_PATH" >/dev/null 2>&1; then
+    git -C "$HERMES_DIR" apply --3way "$PATCH_PATH"
+    echo "Applied patch: $PATCH_PATH"
+    continue
+  fi
+
+  echo "Patch no longer applies cleanly: $PATCH_PATH" >&2
+  echo "Refresh the external bundle instead of editing Hermes directly." >&2
+  exit 1
 done

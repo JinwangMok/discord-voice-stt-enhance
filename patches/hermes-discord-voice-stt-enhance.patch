@@ -1,5 +1,5 @@
 diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
-index 51a8780a..a8fb967f 100644
+index 31973b96..92cefc51 100644
 --- a/gateway/platforms/discord.py
 +++ b/gateway/platforms/discord.py
 @@ -10,6 +10,7 @@ Uses discord.py library for:
@@ -10,7 +10,7 @@ index 51a8780a..a8fb967f 100644
  import logging
  import os
  import struct
-@@ -91,6 +92,10 @@ class VoiceReceiver:
+@@ -128,6 +129,10 @@ class VoiceReceiver:
  
      SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
      MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
@@ -21,7 +21,7 @@ index 51a8780a..a8fb967f 100644
      SAMPLE_RATE = 48000        # Discord native rate
      CHANNELS = 2               # Discord sends stereo
  
-@@ -357,6 +362,11 @@ class VoiceReceiver:
+@@ -420,6 +425,11 @@ class VoiceReceiver:
                  buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
  
                  if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
@@ -33,7 +33,7 @@ index 51a8780a..a8fb967f 100644
                      user_id = ssrc_user_map.get(ssrc, 0)
                      if not user_id:
                          # SSRC not mapped (SPEAKING event missing after bot rejoin).
-@@ -373,6 +383,59 @@ class VoiceReceiver:
+@@ -436,6 +446,59 @@ class VoiceReceiver:
  
          return completed
  
@@ -93,7 +93,7 @@ index 51a8780a..a8fb967f 100644
      # ------------------------------------------------------------------
      # PCM -> WAV conversion (for Whisper STT)
      # ------------------------------------------------------------------
-@@ -445,6 +508,10 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -509,6 +572,10 @@ class DiscordAdapter(BasePlatformAdapter):
          # Phase 2: voice listening
          self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
          self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
@@ -104,7 +104,7 @@ index 51a8780a..a8fb967f 100644
          self._voice_input_callback: Optional[Callable] = None  # set by run.py
          self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
          # Track threads where the bot has participated so follow-up messages
-@@ -1019,8 +1086,10 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1256,8 +1323,10 @@ class DiscordAdapter(BasePlatformAdapter):
              receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
              receiver.start()
              self._voice_receivers[guild_id] = receiver
@@ -116,7 +116,7 @@ index 51a8780a..a8fb967f 100644
              )
          except Exception as e:
              logger.warning("Voice receiver failed to start: %s", e)
-@@ -1029,25 +1098,47 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1266,25 +1335,47 @@ class DiscordAdapter(BasePlatformAdapter):
  
      async def leave_voice_channel(self, guild_id: int) -> None:
          """Disconnect from the voice channel in a guild."""
@@ -166,7 +166,7 @@ index 51a8780a..a8fb967f 100644
  
      async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
          """Play an audio file in the connected voice channel."""
-@@ -1213,18 +1304,83 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1450,18 +1541,83 @@ class DiscordAdapter(BasePlatformAdapter):
      # Voice listening (Phase 2)
      # ------------------------------------------------------------------
  
@@ -255,7 +255,7 @@ index 51a8780a..a8fb967f 100644
                  await asyncio.sleep(0.2)
  
                  # Send periodic UDP keepalive to prevent Discord from
-@@ -1243,7 +1399,12 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1480,7 +1636,12 @@ class DiscordAdapter(BasePlatformAdapter):
                  for user_id, pcm_data in completed:
                      if not self._is_allowed_user(str(user_id)):
                          continue
@@ -269,7 +269,7 @@ index 51a8780a..a8fb967f 100644
          except asyncio.CancelledError:
              pass
          except Exception as e:
-@@ -1260,13 +1421,15 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1497,13 +1658,15 @@ class DiscordAdapter(BasePlatformAdapter):
              await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
  
              from tools.transcription_tools import transcribe_audio
@@ -286,7 +286,7 @@ index 51a8780a..a8fb967f 100644
  
              logger.info("Voice input from user %d: %s", user_id, transcript[:100])
  
-@@ -1284,6 +1447,11 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -1521,6 +1684,11 @@ class DiscordAdapter(BasePlatformAdapter):
              except OSError:
                  pass
  
@@ -295,11 +295,11 @@ index 51a8780a..a8fb967f 100644
 +        normalized = re.sub(r"[\W_]+", "", transcript, flags=re.UNICODE)
 +        return not normalized
 +
-     def _is_allowed_user(self, user_id: str) -> bool:
-         """Check if user is in DISCORD_ALLOWED_USERS."""
-         if not self._allowed_user_ids:
+     def _is_allowed_user(self, user_id: str, author=None) -> bool:
+         """Check if user is allowed via DISCORD_ALLOWED_USERS or DISCORD_ALLOWED_ROLES.
+ 
 diff --git a/tests/gateway/test_voice_command.py b/tests/gateway/test_voice_command.py
-index f0c3171d..85cdd539 100644
+index f25fb972..c8da0e1d 100644
 --- a/tests/gateway/test_voice_command.py
 +++ b/tests/gateway/test_voice_command.py
 @@ -1,9 +1,12 @@
@@ -580,44 +580,6 @@ index f0c3171d..85cdd539 100644
              await asyncio.sleep(0.3)
              receiver._running = False  # stop loop
              await asyncio.sleep(0.1)
-diff --git a/tests/tools/test_managed_media_gateways.py b/tests/tools/test_managed_media_gateways.py
-index ecbf71c2..c7261a30 100644
---- a/tests/tools/test_managed_media_gateways.py
-+++ b/tests/tools/test_managed_media_gateways.py
-@@ -250,6 +250,33 @@ def test_openai_tts_accepts_openai_api_key_as_direct_fallback(monkeypatch, tmp_p
-     assert captured["close_calls"] == 1
- 
- 
-+def test_openai_tts_accepts_configured_api_key_and_base_url(monkeypatch, tmp_path):
-+    captured = {}
-+    _install_fake_tools_package()
-+    _install_fake_openai_module(captured)
-+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
-+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-+    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")
-+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
-+
-+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
-+    output_path = tmp_path / "speech.mp3"
-+    tts_tool._generate_openai_tts(
-+        "hello world",
-+        str(output_path),
-+        {
-+            "openai": {
-+                "api_key": "config-key",
-+                "base_url": "http://10.40.40.40/tts/v1",
-+            }
-+        },
-+    )
-+
-+    assert captured["api_key"] == "config-key"
-+    assert captured["base_url"] == "http://10.40.40.40/tts/v1"
-+    assert captured["close_calls"] == 1
-+
-+
- def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_path):
-     whisper_capture = {}
-     _install_fake_tools_package()
 diff --git a/tests/tools/test_transcription_tools.py b/tests/tools/test_transcription_tools.py
 index effd4e1a..7cd08fb7 100644
 --- a/tests/tools/test_transcription_tools.py
@@ -829,56 +791,3 @@ index 3fdf0cc0..f4c1503a 100644
          return _transcribe_groq(file_path, model_name)
  
      if provider == "openai":
-diff --git a/tools/tts_tool.py b/tools/tts_tool.py
-index 769ae30a..f347668b 100644
---- a/tools/tts_tool.py
-+++ b/tools/tts_tool.py
-@@ -261,7 +261,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
-     Returns:
-         Path to the saved audio file.
-     """
--    api_key, base_url = _resolve_openai_audio_client_config()
-+    api_key, base_url = _resolve_openai_audio_client_config(tts_config)
- 
-     oai_config = tts_config.get("openai", {})
-     model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
-@@ -743,15 +743,21 @@ def check_tts_requirements() -> bool:
-     return False
- 
- 
--def _resolve_openai_audio_client_config() -> tuple[str, str]:
--    """Return direct OpenAI audio config or a managed gateway fallback."""
-+def _resolve_openai_audio_client_config(tts_config: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
-+    """Return config-driven OpenAI audio config or a managed gateway fallback."""
-+    openai_cfg = (tts_config or {}).get("openai", {})
-+    cfg_api_key = str(openai_cfg.get("api_key", "") or "").strip()
-+    cfg_base_url = str(openai_cfg.get("base_url", "") or "").strip()
-+    if cfg_api_key:
-+        return cfg_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL)
-+
-     direct_api_key = resolve_openai_audio_api_key()
-     if direct_api_key:
-         return direct_api_key, DEFAULT_OPENAI_BASE_URL
- 
-     managed_gateway = resolve_managed_tool_gateway("openai-audio")
-     if managed_gateway is None:
--        message = "Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set"
-+        message = "Neither tts.openai.api_key in config nor VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
-         if managed_nous_tools_enabled():
-             message += ", and the managed OpenAI audio gateway is unavailable"
-         raise ValueError(message)
-@@ -762,8 +768,12 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
- 
- 
- def _has_openai_audio_backend() -> bool:
--    """Return True when OpenAI audio can use direct credentials or the managed gateway."""
--    return bool(resolve_openai_audio_api_key() or resolve_managed_tool_gateway("openai-audio"))
-+    """Return True when OpenAI audio can use config credentials, env credentials, or the managed gateway."""
-+    try:
-+        _resolve_openai_audio_client_config(_load_tts_config())
-+        return True
-+    except ValueError:
-+        return False
- 
- 
- # ===========================================================================
